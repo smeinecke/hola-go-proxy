@@ -111,7 +111,13 @@ type CLIArgs struct {
 }
 
 func parse_args() *CLIArgs {
+	// Without a home directory, disable session persistence rather than
+	// writing .hola_session.json into the current working directory.
 	home, _ := os.UserHomeDir()
+	defaultSessionFile := ""
+	if home != "" {
+		defaultSessionFile = filepath.Join(home, ".hola_session.json")
+	}
 	args := &CLIArgs{
 		resolver: &CSVArg{
 			values: []string{
@@ -162,7 +168,7 @@ func parse_args() *CLIArgs {
 			return nil
 		})
 	flag.BoolVar(&args.hideSNI, "hide-SNI", true, "hide SNI in TLS sessions with proxy server")
-	flag.StringVar(&args.sessionFile, "session-file", filepath.Join(home, ".hola_session.json"),
+	flag.StringVar(&args.sessionFile, "session-file", defaultSessionFile,
 		"file to persist the Hola session ({uuid, sessionKey}) for reuse across restarts. "+
 			"Shared with python-hola. Empty string disables session persistence")
 	flag.StringVar(&args.proxyAuth, "proxy-auth", "", "require authentication on the local "+
@@ -247,6 +253,10 @@ func run() int {
 		}
 		dialer = pxDialer.(ContextDialer)
 	}
+	// API requests routed through https:// proxies (fallback agents or the
+	// user's -proxy) use this as the underlying connection.
+	baseDialer = dialer
+	baseProxyURL = args.proxy
 
 	try := retryPolicy(args.initRetries, args.initRetryInterval, mainLogger)
 
@@ -326,8 +336,12 @@ func run() int {
 		return 4
 	}
 	endpoints, err := get_endpoints(tunnels, args.proxy_type, args.use_trial, args.force_port_field)
-	if err != nil || len(endpoints) == 0 {
+	if err != nil {
 		mainLogger.Critical("Unable to determine proxy endpoint: %v", err)
+		return 5
+	}
+	if len(endpoints) == 0 {
+		mainLogger.Critical("No tunnel endpoints found in API response")
 		return 5
 	}
 	var endpoint *Endpoint

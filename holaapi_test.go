@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
+	"time"
 )
 
 func TestZGetTunnelsBlocked(t *testing.T) {
@@ -58,5 +61,33 @@ func TestCommonParams(t *testing.T) {
 	}
 	if params.Get("ext_ver") != "1.2.3" || params.Get("rmt_ver") != "1.2.3" {
 		t.Fatal("ext_ver/rmt_ver mismatch")
+	}
+}
+
+func TestEnsureTransactionPermanentBanAborts(t *testing.T) {
+	calls := 0
+	err := EnsureTransaction(context.Background(), time.Second, "", func(ctx context.Context, purl string) error {
+		calls++
+		return PermanentBanError
+	})
+	if !errors.Is(err, PermanentBanError) {
+		t.Fatalf("expected PermanentBanError, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected abort after first attempt, got %d calls", calls)
+	}
+}
+
+func TestEnsureTransactionSuccess(t *testing.T) {
+	calls := 0
+	err := EnsureTransaction(context.Background(), time.Second, "", func(ctx context.Context, purl string) error {
+		calls++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected a single attempt, got %d calls", calls)
 	}
 }

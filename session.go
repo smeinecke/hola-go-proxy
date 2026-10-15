@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 )
 
 // Session holds the reusable Hola session credentials. The file format
@@ -38,10 +39,27 @@ func (s *Session) save(path string) error {
 	if path == "" || s == nil || s.UUID == "" || s.SessionKey == 0 {
 		return nil
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	// Write to a temp file and rename so a crash mid-write cannot leave a
+	// corrupt session file behind.
+	f, err := os.CreateTemp(filepath.Dir(path), ".hola_session-*.tmp")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return json.NewEncoder(f).Encode(s)
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	// Enforce mode explicitly: O_CREATE's mode does not apply when the
+	// target already exists with looser permissions (e.g. written by
+	// python-hola under a permissive umask).
+	if err := f.Chmod(0600); err != nil {
+		f.Close()
+		return err
+	}
+	if err := json.NewEncoder(f).Encode(s); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }

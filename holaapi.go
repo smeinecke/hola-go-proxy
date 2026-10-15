@@ -8,10 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net"
+	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +25,7 @@ import (
 	"github.com/campoy/unique"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/google/uuid"
+	tls "github.com/refraction-networking/utls"
 )
 
 const EXT_BROWSER = "chrome"
@@ -36,6 +40,10 @@ const AGENT_SUFFIX = ".hola.org"
 // Mimic a real Chrome extension request as closely as possible.
 const EXT_ORIGIN = "chrome-extension://gkojfkhlekighikafcpjkiklfbnlmeio"
 const ACCEPT_LANGUAGE = "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+
+// ACCEPT_ENCODING advertises only encodings CycleTLS can transparently
+// decompress (gzip, deflate, br - no zstd support upstream).
+const ACCEPT_ENCODING = "gzip, deflate, br"
 
 var HEADER_ORDER = []string{
 	"host",
@@ -165,6 +173,19 @@ func (a *FallbackAgent) NetAddr() string {
 
 var cclient = cycletls.Init()
 
+// directDialer makes plain TCP connections. baseDialer is the underlying
+// transport for API requests routed through an https:// proxy: main() replaces
+// it with the user's base proxy dialer when -proxy is set, so fallback agent
+// connections are still chained through it. baseProxyURL holds the -proxy
+// value so requests to the user's own proxy dial it directly instead of
+// chaining it through itself.
+var directDialer ContextDialer = &net.Dialer{
+	Timeout:   30 * time.Second,
+	KeepAlive: 30 * time.Second,
+}
+var baseDialer ContextDialer = directDialer
+var baseProxyURL string
+
 func commonParams(extVer string) url.Values {
 	params := make(url.Values)
 	params.Add("rmt_ver", extVer)
@@ -178,6 +199,18 @@ func commonParams(extVer string) url.Values {
 func do_req(ctx context.Context, proxyURL, method, reqURL string, query, data url.Values) ([]byte, error) {
 	if method == "" {
 		method = "GET"
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if u, perr := url.Parse(proxyURL); perr == nil && strings.EqualFold(u.Scheme, "https") {
+		// CycleTLS dials https:// proxies with stock crypto/tls and
+		// InsecureSkipVerify - use our own verified utls path instead.
+		next := baseDialer
+		if proxyURL == baseProxyURL {
+			next = directDialer
+		}
+		return doReqViaHTTPSProxy(ctx, u, next, method, reqURL, query, data)
 	}
 	timeout := 35
 	if dl, ok := ctx.Deadline(); ok {
@@ -194,16 +227,22 @@ func do_req(ctx context.Context, proxyURL, method, reqURL string, query, data ur
 		reqURL += sep + query.Encode()
 	}
 	opts := cycletls.Options{
-		URL:                   reqURL,
-		UserAgent:             userAgent,
-		Proxy:                 proxyURL,
-		Timeout:               timeout,
-		DisableRedirect:       true,
-		EnableConnectionReuse: true,
+		URL:       reqURL,
+		UserAgent: userAgent,
+		Proxy:     proxyURL,
+		Timeout:   timeout,
+		// Follow redirects: the Dropbox fallback conf URL legitimately
+		// 302s to a CDN link.
+		DisableRedirect: false,
+		// CycleTLS caches connections per pooled client but never evicts
+		// dead ones, so reuse would wedge a long-running process on a
+		// stale connection.
+		EnableConnectionReuse: false,
 		HeaderOrder:           HEADER_ORDER,
 		Headers: map[string]string{
 			"Origin":          EXT_ORIGIN,
 			"Accept-Language": ACCEPT_LANGUAGE,
+			"Accept-Encoding": ACCEPT_ENCODING,
 		},
 	}
 	if data != nil {
@@ -215,9 +254,91 @@ func do_req(ctx context.Context, proxyURL, method, reqURL string, query, data ur
 		return nil, err
 	}
 	if resp.Status < 200 || resp.Status > 204 {
-		return nil, fmt.Errorf("bad HTTP response: %d", resp.Status)
+		// CycleTLS reports transport failures as a fake status with the
+		// real error text in the body - surface it for debugging.
+		const maxErrLen = 200
+		msg := resp.Body
+		if len(msg) > maxErrLen {
+			msg = msg[:maxErrLen] + "..."
+		}
+		return nil, fmt.Errorf("bad HTTP response: %d: %s", resp.Status, strings.TrimSpace(msg))
 	}
 	return []byte(resp.Body), nil
+}
+
+// doReqViaHTTPSProxy issues the API request through an https:// proxy using
+// ProxyDialer for the proxy hop (utls handshake with certificate verification
+// instead of CycleTLS's unverified stock-TLS connect) and a utls Chrome
+// ClientHello for the tunneled request itself.
+func doReqViaHTTPSProxy(ctx context.Context, proxy *url.URL, next ContextDialer, method, reqURL string, query, data url.Values) ([]byte, error) {
+	pd, err := ProxyDialerFromURL(proxy, caPool, next)
+	if err != nil {
+		return nil, err
+	}
+	// Hola agents worked with a suppressed SNI; for a user-supplied proxy the
+	// SNI may be required for vhost routing, so only hide it for *.hola.org.
+	if strings.HasSuffix(proxy.Hostname(), AGENT_SUFFIX) {
+		pd.hideSNI = hideSNI
+	}
+	var body io.Reader
+	if data != nil {
+		body = bytes.NewReader([]byte(data.Encode()))
+	}
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
+	if err != nil {
+		return nil, err
+	}
+	if data != nil {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	if query != nil {
+		// Append to any query already present in reqURL, matching the
+		// CycleTLS code path.
+		if req.URL.RawQuery != "" {
+			req.URL.RawQuery += "&" + query.Encode()
+		} else {
+			req.URL.RawQuery = query.Encode()
+		}
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Origin", EXT_ORIGIN)
+	req.Header.Set("Accept-Language", ACCEPT_LANGUAGE)
+	// No explicit Accept-Encoding: the transport advertises gzip itself and
+	// transparently decompresses only when it did so.
+	tr := &http.Transport{
+		DialContext: pd.DialContext,
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := pd.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("hostname extraction error: %w", err)
+			}
+			tlsConn := tls.UClient(conn, &tls.Config{
+				ServerName: host,
+				RootCAs:    caPool,
+			}, tls.HelloChrome_Auto)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("UClient handshake failed: %w", err)
+			}
+			return tlsConn, nil
+		},
+		DisableKeepAlives: true,
+	}
+	defer tr.CloseIdleConnections()
+	resp, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 204 {
+		return nil, fmt.Errorf("bad HTTP response: %s", resp.Status)
+	}
+	return io.ReadAll(resp.Body)
 }
 
 func VPNCountries(ctx context.Context, proxyURL, extVer string) (res CountryList, err error) {
@@ -273,8 +394,7 @@ func validateSession(ctx context.Context, proxyURL, extVer, user_uuid string, se
 		Blocked bool `json:"blocked"`
 	}
 	if err := json.Unmarshal(data, &obj); err != nil {
-		// A non-object truthy response still means the session was accepted.
-		return true, nil
+		return false, fmt.Errorf("unable to parse rules_get_vpn response: %w", err)
 	}
 	return !obj.Blocked, nil
 }
@@ -402,6 +522,10 @@ func Tunnels(ctx context.Context,
 	sessionFile string,
 ) (res *ZGetTunnelsResponse, user_uuid string, reterr error) {
 	var sessionKey int64
+	// reused tracks whether credentials came from the session file (rather
+	// than a fresh background_init), so a stale stored session can be
+	// re-registered once if zgettunnels rejects it.
+	reused := false
 	sess, err := loadSession(sessionFile)
 	if err != nil {
 		logger.Warning("Could not load session file %s: %v", sessionFile, err)
@@ -410,11 +534,20 @@ func Tunnels(ctx context.Context,
 		ctx1, cancel := context.WithTimeout(ctx, timeout)
 		valid, verr := validateSession(ctx1, proxyURL, extVer, sess.UUID, sess.SessionKey)
 		cancel()
-		if verr == nil && valid {
+		switch {
+		case verr != nil:
+			// A transient validation error must not cost a rate-limited
+			// registration - reuse the stored session optimistically and
+			// let zgettunnels arbitrate.
 			user_uuid, sessionKey = sess.UUID, sess.SessionKey
+			reused = true
+			logger.Warning("Session validation failed (%v); reusing stored session optimistically", verr)
+		case valid:
+			user_uuid, sessionKey = sess.UUID, sess.SessionKey
+			reused = true
 			logger.Info("Reusing session from %s", sessionFile)
-		} else {
-			logger.Warning("Stored session is invalid (%v), registering a new one", verr)
+		default:
+			logger.Warning("Stored session was rejected, registering a new one")
 		}
 	}
 	if user_uuid == "" {
@@ -448,7 +581,39 @@ func Tunnels(ctx context.Context,
 		defer cancel()
 		res, reterr = zgettunnels(ctx1, proxyURL, user_uuid, sessionKey, extVer, country, proxy_type, limit)
 		if errors.Is(reterr, PermanentBanError) {
+			// The persisted session is poisoned - drop it so the next run
+			// does not validate and reuse it.
+			if sessionFile != "" {
+				os.Remove(sessionFile)
+			}
 			return backoff.Permanent(reterr)
+		}
+		if errors.Is(reterr, TemporaryBanError) && reused {
+			// The stored session turned out to be stale despite passing
+			// (or skipping) validation - re-register once and let backoff
+			// retry zgettunnels with the fresh credentials.
+			reused = false
+			u := uuid.New()
+			newUUID := hex.EncodeToString(u[:])
+			ctx2, cancel2 := context.WithTimeout(ctx, timeout)
+			initres, ierr := background_init(ctx2, proxyURL, extVer, newUUID)
+			cancel2()
+			if ierr != nil {
+				if errors.Is(ierr, PermanentBanError) {
+					if sessionFile != "" {
+						os.Remove(sessionFile)
+					}
+					return backoff.Permanent(ierr)
+				}
+				logger.Warning("Re-registration after stale session failed: %v", ierr)
+				return reterr
+			}
+			user_uuid, sessionKey = newUUID, initres.Key
+			logger.Info("Stored session rejected upstream; registered a new one")
+			sess = &Session{UUID: user_uuid, SessionKey: sessionKey}
+			if err := sess.save(sessionFile); err != nil {
+				logger.Warning("Could not save session file %s: %v", sessionFile, err)
+			}
 		}
 		return reterr
 	}, bo, func(err error, dur time.Duration) {
@@ -467,9 +632,20 @@ func SetHideSNI(hide bool) {
 	hideSNI = hide
 }
 
-func EnsureTransaction(ctx context.Context, getFBTimeout time.Duration, baseProxy string, txn func(context.Context, string) bool) (bool, error) {
-	if txn(ctx, baseProxy) {
-		return true, nil
+// EnsureTransaction runs txn against the base proxy first and then against
+// each fallback agent until one succeeds. It returns nil on success, the last
+// txn error when every attempt failed, or the fallback config fetch error.
+// Fatal errors (permanent ban) abort the whole loop immediately instead of
+// hammering the registration endpoint with one background_init per agent.
+func EnsureTransaction(ctx context.Context, getFBTimeout time.Duration, baseProxy string, txn func(context.Context, string) error) error {
+	var lastErr error
+	if err := txn(ctx, baseProxy); err == nil {
+		return nil
+	} else {
+		lastErr = err
+		if errors.Is(err, PermanentBanError) {
+			return err
+		}
 	}
 
 	// Fallback needed
@@ -477,16 +653,21 @@ func EnsureTransaction(ctx context.Context, getFBTimeout time.Duration, baseProx
 	defer cancel()
 	fbc, err := GetFallbackProxies(getFBCtx)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	for _, agent := range fbc.Agents {
-		if txn(ctx, agent.ToProxy().String()) {
-			return true, nil
+		if err := txn(ctx, agent.ToProxy().String()); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if errors.Is(err, PermanentBanError) {
+				return err
+			}
 		}
 	}
 
-	return false, nil
+	return lastErr
 }
 
 func TemplateLogin(user_uuid string) string {

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
@@ -126,25 +127,21 @@ func print_countries(try func(string, func() error) error, timeout time.Duration
 	var (
 		countries CountryList
 		err       error
-		tx_res    bool
-		tx_err    error
 	)
 	err = try("list VPN countries", func() error {
-		tx_res, tx_err = EnsureTransaction(context.Background(), timeout, proxyURL, func(ctx context.Context, purl string) bool {
+		tx_err := EnsureTransaction(context.Background(), timeout, proxyURL, func(ctx context.Context, purl string) error {
 			ctx1, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
-			countries, err = VPNCountries(ctx1, purl, extVer)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Transaction error: %v. Retrying with the fallback mechanism...\n", err)
-				return false
+			res, terr := VPNCountries(ctx1, purl, extVer)
+			if terr != nil {
+				fmt.Fprintf(os.Stderr, "Transaction error: %v. Retrying with the fallback mechanism...\n", terr)
+				return terr
 			}
-			return true
+			countries = res
+			return nil
 		})
 		if tx_err != nil {
-			return fmt.Errorf("transaction recovery mechanism failure: %v", err)
-		}
-		if !tx_res {
-			return errors.New("all fallback proxies failed.")
+			return fmt.Errorf("transaction recovery mechanism failure: %w", tx_err)
 		}
 		return nil
 	})
@@ -165,23 +162,20 @@ func print_proxies(try func(string, func() error) error, logger *CondLogger, ext
 		tunnels   *ZGetTunnelsResponse
 		user_uuid string
 		err       error
-		tx_res    bool
-		tx_err    error
 	)
 	err = try("list proxies", func() error {
-		tx_res, tx_err = EnsureTransaction(context.Background(), timeout, proxyURL, func(ctx context.Context, purl string) bool {
-			tunnels, user_uuid, err = Tunnels(ctx, logger, purl, extVer, country, proxy_type, limit, timeout, backoffInitial, backoffDeadline, sessionFile)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Transaction error: %v. Retrying with the fallback mechanism...\n", err)
-				return false
+		tx_err := EnsureTransaction(context.Background(), timeout, proxyURL, func(ctx context.Context, purl string) error {
+			tuns, uuidRes, terr := Tunnels(ctx, logger, purl, extVer, country, proxy_type, limit, timeout, backoffInitial, backoffDeadline, sessionFile)
+			if terr != nil {
+				fmt.Fprintf(os.Stderr, "Transaction error: %v. Retrying with the fallback mechanism...\n", terr)
+				return terr
 			}
-			return true
+			tunnels, user_uuid = tuns, uuidRes
+			return nil
 		})
 		if tx_err != nil {
-			return fmt.Errorf("transaction recovery mechanism failure: %v", err)
-		}
-		if !tx_res {
-			return errors.New("all fallback proxies failed.")
+			// %w keeps PermanentBanError detectable by retryPolicy.
+			return fmt.Errorf("transaction recovery mechanism failure: %w", tx_err)
 		}
 		return nil
 	})
@@ -197,8 +191,16 @@ func print_proxies(try func(string, func() error) error, logger *CondLogger, ext
 		basic_auth_header(login, password))
 	fmt.Println("")
 	wr.Write([]string{"host", "ip_address", "direct", "peer", "hola", "trial", "trial_peer", "vendor"})
-	for host, ip := range tunnels.IPList {
-		if PROTOCOL_WHITELIST[tunnels.Protocol[host]] {
+	hosts := make([]string, 0, len(tunnels.IPList))
+	for host := range tunnels.IPList {
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+	for _, host := range hosts {
+		ip := tunnels.IPList[host]
+		// Match get_endpoints: keep hosts with no protocol entry, filter
+		// only explicitly non-whitelisted ones.
+		if p, ok := tunnels.Protocol[host]; !ok || PROTOCOL_WHITELIST[p] {
 			wr.Write([]string{host,
 				ip,
 				strconv.FormatUint(uint64(tunnels.Port.Direct), 10),
@@ -320,7 +322,12 @@ func get_endpoint(tunnels *ZGetTunnelsResponse, typ string, trial bool, force_po
 // the exit IP seen by the target matches the advertised ip_list entry.
 func checkEndpoint(ctx context.Context, ep *Endpoint, auth AuthProvider, checkURL string, timeout time.Duration, nextDialer ContextDialer) (string, error) {
 	dialer := NewProxyDialer(ep.NetAddr(), ep.TLSName, caPool, auth, hideSNI, nextDialer)
-	tr := &http.Transport{DialContext: dialer.DialContext}
+	// Use the custom CA pool for the end-to-end TLS handshake so -cafile is
+	// honored here as well.
+	tr := &http.Transport{
+		DialContext:     dialer.DialContext,
+		TLSClientConfig: &tls.Config{RootCAs: caPool},
+	}
 	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, Timeout: timeout}
 	req, err := http.NewRequestWithContext(ctx, "GET", checkURL, nil)

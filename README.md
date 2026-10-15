@@ -131,7 +131,7 @@ zagent248.hola.org,165.22.65.3,22222,22223,22224,22225,22226,digitalocean
 | check-url | String | URL used by -check; must return a JSON document with an "ip" field (default "https://checkip.greensec.de/json") |
 | country | String | desired proxy location - any valid alpha-2 code is accepted, even if absent from -list-countries (default "us") |
 | dont-use-trial | - | use regular ports instead of trial ports |
-| ext-ver | String | extension version to mimic in requests. Can be obtained from https://chrome.google.com/webstore/detail/hola-vpn-the-website-unbl/gkojfkhlekighikafcpjkiklfbnlmeio (default "999.999.999") |
+| ext-ver | String | extension version to mimic in requests. Can be obtained from https://chrome.google.com/webstore/detail/hola-vpn-the-website-unbl/gkojfkhlekighikafcpjkiklfbnlmeio (default: auto-detected from the Chrome Web Store) |
 | force-port-field | Number | force specific port field/num (example 24232 or lum) |
 | hide-SNI | Boolean | hide SNI in TLS sessions with proxy server (default true) |
 | init-retries | Number | number of attempts for initialization steps, zero for unlimited retry |
