@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	stdtls "crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -26,6 +27,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/google/uuid"
 	tls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 const EXT_BROWSER = "chrome"
@@ -305,9 +307,14 @@ func doReqViaHTTPSProxy(ctx context.Context, proxy *url.URL, next ContextDialer,
 	req.Header.Set("Accept-Language", ACCEPT_LANGUAGE)
 	// No explicit Accept-Encoding: the transport advertises gzip itself and
 	// transparently decompresses only when it did so.
-	tr := &http.Transport{
-		DialContext: pd.DialContext,
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+	//
+	// Force HTTP/2 like the extension. A plain http.Transport cannot
+	// negotiate h2 over a utls conn (ConnectionState type differs from
+	// crypto/tls), so use http2.Transport with a custom dialer and fail
+	// the dial if the endpoint does not speak h2.
+	tr2 := &http2.Transport{
+		AllowHTTP: false,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *stdtls.Config) (net.Conn, error) {
 			conn, err := pd.DialContext(ctx, network, addr)
 			if err != nil {
 				return nil, err
@@ -320,17 +327,21 @@ func doReqViaHTTPSProxy(ctx context.Context, proxy *url.URL, next ContextDialer,
 			tlsConn := tls.UClient(conn, &tls.Config{
 				ServerName: host,
 				RootCAs:    caPool,
+				NextProtos: []string{"h2"},
 			}, tls.HelloChrome_Auto)
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				conn.Close()
 				return nil, fmt.Errorf("UClient handshake failed: %w", err)
 			}
+			if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
+				tlsConn.Close()
+				return nil, errors.New("endpoint does not negotiate HTTP/2")
+			}
 			return tlsConn, nil
 		},
-		DisableKeepAlives: true,
 	}
-	defer tr.CloseIdleConnections()
-	resp, err := (&http.Client{Transport: tr}).Do(req)
+	defer tr2.CloseIdleConnections()
+	resp, err := (&http.Client{Transport: tr2}).Do(req)
 	if err != nil {
 		return nil, err
 	}
