@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"net/http"
 	"sync"
 	"time"
 )
@@ -16,6 +15,8 @@ func CredService(interval, timeout time.Duration,
 	logger *CondLogger,
 	backoffInitial time.Duration,
 	backoffDeadline time.Duration,
+	sessionFile string,
+	baseProxy string,
 ) (auth AuthProvider, tunnels *ZGetTunnelsResponse, err error) {
 	var mux sync.Mutex
 	var auth_header, user_uuid string
@@ -25,9 +26,9 @@ func CredService(interval, timeout time.Duration,
 		return auth_header
 	}
 
-	tx_res, tx_err := EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) bool {
-		tunnels, user_uuid, err = Tunnels(ctx, logger, client, extVer, country, proxytype,
-			DEFAULT_LIST_LIMIT, timeout, backoffInitial, backoffDeadline)
+	tx_res, tx_err := EnsureTransaction(context.Background(), timeout, baseProxy, func(ctx context.Context, purl string) bool {
+		tunnels, user_uuid, err = Tunnels(ctx, logger, purl, extVer, country, proxytype,
+			DEFAULT_LIST_LIMIT, timeout, backoffInitial, backoffDeadline, sessionFile)
 		if err != nil {
 			logger.Error("Configuration bootstrap error: %v. Retrying with the fallback mechanism...", err)
 			return false
@@ -58,9 +59,9 @@ func CredService(interval, timeout time.Duration,
 		for {
 			<-ticker.C
 			logger.Info("Rotating credentials...")
-			tx_res, tx_err := EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) bool {
-				tuns, user_uuid, err = Tunnels(ctx, logger, client, extVer, country, proxytype,
-					DEFAULT_LIST_LIMIT, timeout, backoffInitial, backoffDeadline)
+			tx_res, tx_err := EnsureTransaction(context.Background(), timeout, baseProxy, func(ctx context.Context, purl string) bool {
+				tuns, user_uuid, err = Tunnels(ctx, logger, purl, extVer, country, proxytype,
+					DEFAULT_LIST_LIMIT, timeout, backoffInitial, backoffDeadline, sessionFile)
 				if err != nil {
 					logger.Error("Credential rotation error: %v. Retrying with the fallback mechanism...", err)
 					return false

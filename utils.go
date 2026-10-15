@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,9 +24,10 @@ import (
 const COPY_BUF = 128 * 1024
 
 type Endpoint struct {
-	Host    string
-	Port    uint16
-	TLSName string
+	Host     string
+	Port     uint16
+	TLSName  string
+	ExpectIP string
 }
 
 func (e *Endpoint) URL() *url.URL {
@@ -46,7 +49,7 @@ func (e *Endpoint) NetAddr() string {
 }
 
 func basic_auth_header(login, password string) string {
-	return "basic " + base64.StdEncoding.EncodeToString(
+	return "Basic " + base64.StdEncoding.EncodeToString(
 		[]byte(login+":"+password))
 }
 
@@ -106,7 +109,20 @@ func proxyh2(ctx context.Context, leftreader io.ReadCloser, leftwriter io.Writer
 	return
 }
 
-func print_countries(try func(string, func() error) error, timeout time.Duration) int {
+func mergeCountries(list CountryList) CountryList {
+	merged := append(CountryList{}, list...)
+	merged = append(merged, EXTRA_COUNTRIES...)
+	sort.Strings(merged)
+	out := merged[:0]
+	for i, c := range merged {
+		if i == 0 || c != merged[i-1] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func print_countries(try func(string, func() error) error, timeout time.Duration, extVer, proxyURL string) int {
 	var (
 		countries CountryList
 		err       error
@@ -114,10 +130,10 @@ func print_countries(try func(string, func() error) error, timeout time.Duration
 		tx_err    error
 	)
 	err = try("list VPN countries", func() error {
-		tx_res, tx_err = EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) bool {
+		tx_res, tx_err = EnsureTransaction(context.Background(), timeout, proxyURL, func(ctx context.Context, purl string) bool {
 			ctx1, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
-			countries, err = VPNCountries(ctx1, client)
+			countries, err = VPNCountries(ctx1, purl, extVer)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Transaction error: %v. Retrying with the fallback mechanism...\n", err)
 				return false
@@ -135,7 +151,7 @@ func print_countries(try func(string, func() error) error, timeout time.Duration
 	if err != nil {
 		return 3
 	}
-	for _, code := range countries {
+	for _, code := range mergeCountries(countries) {
 		fmt.Printf("%v - %v\n", code, ISO3166[strings.ToUpper(code)])
 	}
 	return 0
@@ -143,6 +159,7 @@ func print_countries(try func(string, func() error) error, timeout time.Duration
 
 func print_proxies(try func(string, func() error) error, logger *CondLogger, extVer, country string, proxy_type string,
 	limit uint, timeout time.Duration, backoffInitial time.Duration, backoffDeadline time.Duration,
+	sessionFile, proxyURL string,
 ) int {
 	var (
 		tunnels   *ZGetTunnelsResponse
@@ -152,8 +169,8 @@ func print_proxies(try func(string, func() error) error, logger *CondLogger, ext
 		tx_err    error
 	)
 	err = try("list proxies", func() error {
-		tx_res, tx_err = EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) bool {
-			tunnels, user_uuid, err = Tunnels(ctx, logger, client, extVer, country, proxy_type, limit, timeout, backoffInitial, backoffDeadline)
+		tx_res, tx_err = EnsureTransaction(context.Background(), timeout, proxyURL, func(ctx context.Context, purl string) bool {
+			tunnels, user_uuid, err = Tunnels(ctx, logger, purl, extVer, country, proxy_type, limit, timeout, backoffInitial, backoffDeadline, sessionFile)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Transaction error: %v. Retrying with the fallback mechanism...\n", err)
 				return false
@@ -196,49 +213,142 @@ func print_proxies(try func(string, func() error) error, logger *CondLogger, ext
 	return 0
 }
 
-func get_endpoint(tunnels *ZGetTunnelsResponse, typ string, trial bool, force_port_field string) (*Endpoint, error) {
-	var hostname, ip string
-	for k, v := range tunnels.IPList {
-		hostname = k
-		ip = v
-		break
+func resolvePort(typ string, trial bool, force_port_field string, portMap PortMap) (uint16, error) {
+	if force_port_field != "" {
+		if p, err := strconv.ParseUint(force_port_field, 0, 16); err == nil {
+			return uint16(p), nil
+		}
+		typ = force_port_field
 	}
-	if hostname == "" || ip == "" {
+	switch typ {
+	case "direct", "lum", "pool", "virt":
+		if !trial {
+			return portMap.Trial, nil
+		}
+		return portMap.Direct, nil
+	case "peer":
+		if !trial {
+			return portMap.TrialPeer, nil
+		}
+		return portMap.Peer, nil
+	case "skip":
+		return 0, nil
+	default:
+		return 0, errors.New("Unsupported port type")
+	}
+}
+
+func get_endpoints(tunnels *ZGetTunnelsResponse, typ string, trial bool, force_port_field string) ([]*Endpoint, error) {
+	port, err := resolvePort(typ, trial, force_port_field, tunnels.Port)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(tunnels.Ztun))
+	for k := range tunnels.Ztun {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	seen := make(map[string]bool)
+	var endpoints []*Endpoint
+	for _, k := range keys {
+		for _, entry := range tunnels.Ztun[k] {
+			// ztun entries may carry a scheme prefix like "HTTP host:port"
+			fields := strings.Fields(entry)
+			if len(fields) == 0 {
+				continue
+			}
+			host, _, serr := net.SplitHostPort(fields[len(fields)-1])
+			if serr != nil || host == "" || seen[host] {
+				continue
+			}
+			seen[host] = true
+			if p, ok := tunnels.Protocol[host]; ok && !PROTOCOL_WHITELIST[p] {
+				continue
+			}
+			ip := tunnels.IPList[host]
+			dialHost := ip
+			if dialHost == "" {
+				dialHost = host
+			}
+			endpoints = append(endpoints, &Endpoint{
+				Host:     dialHost,
+				Port:     port,
+				TLSName:  host,
+				ExpectIP: ip,
+			})
+		}
+	}
+	if len(endpoints) == 0 {
+		// Fall back to ip_list entries not covered by ztun.
+		hkeys := make([]string, 0, len(tunnels.IPList))
+		for host := range tunnels.IPList {
+			hkeys = append(hkeys, host)
+		}
+		sort.Strings(hkeys)
+		for _, host := range hkeys {
+			ip := tunnels.IPList[host]
+			if ip == "" || seen[host] {
+				continue
+			}
+			if p, ok := tunnels.Protocol[host]; ok && !PROTOCOL_WHITELIST[p] {
+				continue
+			}
+			seen[host] = true
+			endpoints = append(endpoints, &Endpoint{
+				Host:     ip,
+				Port:     port,
+				TLSName:  host,
+				ExpectIP: ip,
+			})
+		}
+	}
+	return endpoints, nil
+}
+
+func get_endpoint(tunnels *ZGetTunnelsResponse, typ string, trial bool, force_port_field string) (*Endpoint, error) {
+	endpoints, err := get_endpoints(tunnels, typ, trial, force_port_field)
+	if err != nil {
+		return nil, err
+	}
+	if len(endpoints) == 0 {
 		return nil, errors.New("No tunnels found in API response")
 	}
+	return endpoints[0], nil
+}
 
-	var port uint16
-	if force_port_field != "" {
-		port2, err := strconv.ParseUint(force_port_field, 0, 16)
-		if err == nil {
-			port = (uint16)(port2)
-			typ = "skip"
-		} else {
-			typ = force_port_field
-		}
+// checkEndpoint verifies that the endpoint tunnel works end to end and that
+// the exit IP seen by the target matches the advertised ip_list entry.
+func checkEndpoint(ctx context.Context, ep *Endpoint, auth AuthProvider, checkURL string, timeout time.Duration, nextDialer ContextDialer) (string, error) {
+	dialer := NewProxyDialer(ep.NetAddr(), ep.TLSName, caPool, auth, hideSNI, nextDialer)
+	tr := &http.Transport{DialContext: dialer.DialContext}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: tr, Timeout: timeout}
+	req, err := http.NewRequestWithContext(ctx, "GET", checkURL, nil)
+	if err != nil {
+		return "", err
 	}
-	if typ != "skip" {
-		if typ == "direct" || typ == "lum" || typ == "pool" || typ == "virt" {
-			if !trial {
-				port = tunnels.Port.Trial
-			} else {
-				port = tunnels.Port.Direct
-			}
-		} else if typ == "peer" {
-			if !trial {
-				port = tunnels.Port.TrialPeer
-			} else {
-				port = tunnels.Port.Peer
-			}
-		} else {
-			return nil, errors.New("Unsupported port type")
-		}
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
 	}
-	return &Endpoint{
-		Host:    ip,
-		Port:    port,
-		TLSName: hostname,
-	}, nil
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("check request returned status %d", resp.StatusCode)
+	}
+	var res struct {
+		IP string `json:"ip"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", fmt.Errorf("unable to parse check response: %w", err)
+	}
+	if res.IP == "" {
+		return "", errors.New("check response carries no ip field")
+	}
+	if ep.ExpectIP != "" && res.IP != ep.ExpectIP {
+		return "", fmt.Errorf("egress IP %s does not match advertised %s", res.IP, ep.ExpectIP)
+	}
+	return res.IP, nil
 }
 
 // Hop-by-hop headers. These are removed when sent to the backend.

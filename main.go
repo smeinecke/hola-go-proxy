@@ -15,10 +15,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
-	tls "github.com/refraction-networking/utls"
 	xproxy "golang.org/x/net/proxy"
 )
 
@@ -29,6 +29,7 @@ const (
 var (
 	PROTOCOL_WHITELIST map[string]bool
 	version            = "undefined"
+	caPool             *x509.CertPool
 )
 
 func init() {
@@ -103,9 +104,14 @@ type CLIArgs struct {
 	initRetryInterval                       time.Duration
 	hideSNI                                 bool
 	userAgent                               *string
+	sessionFile                             string
+	proxyAuth                               string
+	check                                   bool
+	checkURL                                string
 }
 
 func parse_args() *CLIArgs {
+	home, _ := os.UserHomeDir()
 	args := &CLIArgs{
 		resolver: &CSVArg{
 			values: []string{
@@ -156,6 +162,15 @@ func parse_args() *CLIArgs {
 			return nil
 		})
 	flag.BoolVar(&args.hideSNI, "hide-SNI", true, "hide SNI in TLS sessions with proxy server")
+	flag.StringVar(&args.sessionFile, "session-file", filepath.Join(home, ".hola_session.json"),
+		"file to persist the Hola session ({uuid, sessionKey}) for reuse across restarts. "+
+			"Shared with python-hola. Empty string disables session persistence")
+	flag.StringVar(&args.proxyAuth, "proxy-auth", "", "require authentication on the local "+
+		"proxy listener, format: user:password")
+	flag.BoolVar(&args.check, "check", false, "verify tunnel endpoints end-to-end before "+
+		"starting the proxy server")
+	flag.StringVar(&args.checkURL, "check-url", "https://checkip.greensec.de/json",
+		"URL used by -check; must return a JSON document with an \"ip\" field")
 	flag.Parse()
 	if args.country == "" {
 		arg_fail("Country can't be empty string.")
@@ -194,7 +209,6 @@ func run() int {
 		KeepAlive: 30 * time.Second,
 	}
 
-	var caPool *x509.CertPool
 	if args.caFile != "" {
 		caPool = x509.NewCertPool()
 		certs, err := ioutil.ReadFile(args.caFile)
@@ -206,9 +220,6 @@ func run() int {
 			mainLogger.Error("Can't load certificates from CA file")
 			return 15
 		}
-		UpdateHolaTLSConfig(&tls.Config{
-			RootCAs: caPool,
-		})
 	}
 	SetHideSNI(args.hideSNI)
 
@@ -235,14 +246,9 @@ func run() int {
 			return 7
 		}
 		dialer = pxDialer.(ContextDialer)
-		UpdateHolaDialer(dialer)
 	}
 
 	try := retryPolicy(args.initRetries, args.initRetryInterval, mainLogger)
-
-	if args.list_countries {
-		return print_countries(try, args.timeout)
-	}
 
 	mainLogger.Info("hola-proxy client version %s is starting...", version)
 
@@ -291,9 +297,12 @@ func run() int {
 		}
 		mainLogger.Warning("Detected latest extension version: %q. Pass -ext-ver parameter to skip resolve and speedup startup", args.extVer)
 	}
+	if args.list_countries {
+		return print_countries(try, args.timeout, args.extVer, args.proxy)
+	}
 	if args.list_proxies {
 		return print_proxies(try, mainLogger, args.extVer, args.country, args.proxy_type, args.limit, args.timeout,
-			args.backoffInitial, args.backoffDeadline)
+			args.backoffInitial, args.backoffDeadline, args.sessionFile, args.proxy)
 	}
 
 	mainLogger.Info("Constructing fallback DNS upstream...")
@@ -309,22 +318,43 @@ func run() int {
 	)
 	err = try("run credentials service", func() error {
 		auth, tunnels, err = CredService(args.rotate, args.timeout, args.extVer, args.country,
-			args.proxy_type, credLogger, args.backoffInitial, args.backoffDeadline)
+			args.proxy_type, credLogger, args.backoffInitial, args.backoffDeadline,
+			args.sessionFile, args.proxy)
 		return err
 	})
 	if err != nil {
 		return 4
 	}
-	endpoint, err := get_endpoint(tunnels, args.proxy_type, args.use_trial, args.force_port_field)
-	if err != nil {
+	endpoints, err := get_endpoints(tunnels, args.proxy_type, args.use_trial, args.force_port_field)
+	if err != nil || len(endpoints) == 0 {
 		mainLogger.Critical("Unable to determine proxy endpoint: %v", err)
 		return 5
+	}
+	var endpoint *Endpoint
+	if args.check {
+		for _, ep := range endpoints {
+			checkCtx, cancel := context.WithTimeout(context.Background(), args.timeout)
+			ip, cerr := checkEndpoint(checkCtx, ep, auth, args.checkURL, args.timeout, dialer)
+			cancel()
+			if cerr == nil {
+				mainLogger.Info("Endpoint %s verified, egress IP: %s", ep.NetAddr(), ip)
+				endpoint = ep
+				break
+			}
+			mainLogger.Warning("Endpoint %s failed check: %v", ep.NetAddr(), cerr)
+		}
+		if endpoint == nil {
+			mainLogger.Critical("No working endpoint found among %d candidates", len(endpoints))
+			return 5
+		}
+	} else {
+		endpoint = endpoints[0]
 	}
 	handlerDialer := NewProxyDialer(endpoint.NetAddr(), endpoint.TLSName, caPool, auth, args.hideSNI, dialer)
 	requestDialer := NewPlaintextDialer(endpoint.NetAddr(), endpoint.TLSName, caPool, args.hideSNI, dialer)
 	mainLogger.Info("Endpoint: %s", endpoint.URL().String())
 	mainLogger.Info("Starting proxy server...")
-	handler := NewProxyHandler(handlerDialer, requestDialer, auth, resolver, proxyLogger)
+	handler := NewProxyHandler(handlerDialer, requestDialer, auth, args.proxyAuth, resolver, proxyLogger)
 	mainLogger.Info("Init complete.")
 	err = http.ListenAndServe(args.bind_address, handler)
 	mainLogger.Critical("Server terminated with a reason: %v", err)
@@ -349,6 +379,10 @@ func retryPolicy(retries int, retryInterval time.Duration, logger *CondLogger) f
 			if err == nil {
 				logger.Info("Action %q succeeded on attempt #%d", name, i)
 				return nil
+			}
+			if errors.Is(err, PermanentBanError) {
+				logger.Critical("Action %q aborted, server permanently banned us: %v", name, err)
+				return err
 			}
 			logger.Warning("Action %q failed: %v", name, err)
 		}
